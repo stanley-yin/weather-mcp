@@ -5,6 +5,16 @@ import * as z from "zod/v4";
 const NWS_API_BASE = "https://api.weather.gov";
 const USER_AGENT = "weather-app/1.0";
 
+const CWA_API_BASE = "https://opendata.cwa.gov.tw/api/v1/rest/datastore";
+const CWA_API_KEY = process.env.CWA_API_KEY;
+
+const TW_COUNTIES = [
+    "臺北市", "新北市", "桃園市", "臺中市", "臺南市", "高雄市",
+    "基隆市", "新竹市", "嘉義市", "新竹縣", "苗栗縣", "彰化縣",
+    "南投縣", "雲林縣", "嘉義縣", "屏東縣", "宜蘭縣", "花蓮縣",
+    "臺東縣", "澎湖縣", "金門縣", "連江縣",
+] as const;
+
 // Helper function for making NWS API requests
 async function makeNWSRequest<T>(url: string): Promise<T | null> {
     const headers = {
@@ -20,6 +30,35 @@ async function makeNWSRequest<T>(url: string): Promise<T | null> {
         return (await response.json()) as T;
     } catch (error) {
         console.error("Error making NWS request:", error);
+        return null;
+    }
+}
+
+// Helper function for making CWA (Taiwan) open data requests
+async function makeCWARequest<T>(
+    dataId: string,
+    params: Record<string, string> = {},
+): Promise<T | null> {
+    if (!CWA_API_KEY) {
+        throw new Error(
+            "CWA_API_KEY environment variable is not set. Get a free key at https://opendata.cwa.gov.tw/ and set it before running this server.",
+        );
+    }
+
+    const url = new URL(`${CWA_API_BASE}/${dataId}`);
+    url.searchParams.set("Authorization", CWA_API_KEY);
+    for (const [key, value] of Object.entries(params)) {
+        url.searchParams.set(key, value);
+    }
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return (await response.json()) as T;
+    } catch (error) {
+        console.error("Error making CWA request:", error);
         return null;
     }
 }
@@ -59,6 +98,44 @@ interface ForecastResponse {
     };
 }
 
+interface CWAWeatherElementTime {
+    startTime: string;
+    endTime: string;
+    parameter: { parameterName: string; parameterUnit?: string };
+}
+
+interface CWAWeatherElement {
+    elementName: string;
+    time: CWAWeatherElementTime[];
+}
+
+interface CWAForecastResponse {
+    records: {
+        location: {
+            locationName: string;
+            weatherElement: CWAWeatherElement[];
+        }[];
+    };
+}
+
+interface CWAHazard {
+    info?: { phenomena?: string; significance?: string };
+    phenomena?: string;
+    significance?: string;
+    validTime?: { startTime?: string; endTime?: string };
+    startTime?: string;
+    endTime?: string;
+}
+
+interface CWAAlertsResponse {
+    records: {
+        location: {
+            locationName: string;
+            hazardConditions: { hazards: CWAHazard[] };
+        }[];
+    };
+}
+
 /**
  * The output schema of `get-alerts`: a top-level array, not an object, which
  * revision 2026-07-28 is the first to allow. The SDK projects it down to the
@@ -92,8 +169,39 @@ const forecastOutputSchema = z.object({
         .describe("The forecast periods, soonest first"),
 });
 
+/** The output schema of `get-tw-forecast`. */
+const twForecastOutputSchema = z.object({
+    county: z.string().describe("The Taiwan county/city the forecast is for"),
+    periods: z
+        .array(
+            z.object({
+                start_time: z.string(),
+                end_time: z.string(),
+                weather: z.string().describe("Weather phenomenon description"),
+                rain_probability: z.string().describe("Probability of precipitation (%)"),
+                min_temperature: z.string().describe("Minimum temperature (°C)"),
+                max_temperature: z.string().describe("Maximum temperature (°C)"),
+                comfort: z.string().describe("Comfort index description"),
+            }),
+        )
+        .describe("The forecast periods, soonest first"),
+});
+
+/** The output schema of `get-tw-alerts`: a top-level array, matching `get-alerts`. */
+const twAlertsOutputSchema = z.array(
+    z.object({
+        county: z.string().describe("The county/city the alert covers"),
+        phenomena: z.string().describe("The kind of weather hazard"),
+        significance: z.string().describe("The severity/type of the notice"),
+        start_time: z.string(),
+        end_time: z.string(),
+    }),
+);
+
 type Alert = z.infer<typeof alertsOutputSchema>[number];
 type Forecast = z.infer<typeof forecastOutputSchema>;
+type TWForecast = z.infer<typeof twForecastOutputSchema>;
+type TWAlert = z.infer<typeof twAlertsOutputSchema>[number];
 
 // Format alert data for the model to read
 function formatAlert(alert: Alert): string {
@@ -115,6 +223,27 @@ function formatPeriod(period: Forecast["periods"][number]): string {
             : `Temperature: ${period.temperature}°${period.temperature_unit}`,
         `Wind: ${period.wind_speed} ${period.wind_direction}`,
         period.detailed_forecast,
+        "---",
+    ].join("\n");
+}
+
+function formatTWPeriod(period: TWForecast["periods"][number]): string {
+    return [
+        `${period.start_time} ~ ${period.end_time}:`,
+        `Weather: ${period.weather}`,
+        `Rain probability: ${period.rain_probability}%`,
+        `Temperature: ${period.min_temperature}°C ~ ${period.max_temperature}°C`,
+        `Comfort: ${period.comfort}`,
+        "---",
+    ].join("\n");
+}
+
+function formatTWAlert(alert: TWAlert): string {
+    return [
+        `County: ${alert.county}`,
+        `Phenomena: ${alert.phenomena}`,
+        `Significance: ${alert.significance}`,
+        `Valid: ${alert.start_time} ~ ${alert.end_time}`,
         "---",
     ].join("\n");
 }
@@ -233,6 +362,102 @@ function buildServer(): McpServer {
                 .join("\n")}`;
 
             return { content: [{ type: "text", text }], structuredContent: forecast };
+        },
+    );
+
+    server.registerTool(
+        "get-tw-forecast",
+        {
+            title: "Get Taiwan Weather Forecast",
+            description: "Get the 36-hour weather forecast for a Taiwan county/city",
+            inputSchema: z.object({
+                county: z
+                    .enum(TW_COUNTIES)
+                    .describe("Taiwan county/city name, e.g. 臺北市, 高雄市"),
+            }),
+            outputSchema: twForecastOutputSchema,
+        },
+        async ({ county }) => {
+            const data = await makeCWARequest<CWAForecastResponse>("F-C0032-001", {
+                locationName: county,
+            });
+
+            if (!data) {
+                throw new Error(`Failed to retrieve forecast data for ${county}`);
+            }
+
+            const location = data.records.location[0];
+            if (!location) {
+                throw new Error(`No forecast data found for ${county}`);
+            }
+
+            // The elements share identical time boundaries by index, so they
+            // can be zipped together using Wx's periods as the base.
+            const elements = new Map(location.weatherElement.map((el) => [el.elementName, el.time]));
+            const wxTimes = elements.get("Wx") ?? [];
+
+            const periods = wxTimes.map((wx, i) => ({
+                start_time: wx.startTime,
+                end_time: wx.endTime,
+                weather: wx.parameter.parameterName,
+                rain_probability: elements.get("PoP")?.[i]?.parameter.parameterName ?? "Unknown",
+                min_temperature: elements.get("MinT")?.[i]?.parameter.parameterName ?? "Unknown",
+                max_temperature: elements.get("MaxT")?.[i]?.parameter.parameterName ?? "Unknown",
+                comfort: elements.get("CI")?.[i]?.parameter.parameterName ?? "Unknown",
+            }));
+
+            if (periods.length === 0) {
+                throw new Error(`No forecast periods available for ${county}`);
+            }
+
+            const forecast: TWForecast = { county, periods };
+            const text = `Forecast for ${county}:\n\n${periods.map(formatTWPeriod).join("\n")}`;
+
+            return { content: [{ type: "text", text }], structuredContent: forecast };
+        },
+    );
+
+    server.registerTool(
+        "get-tw-alerts",
+        {
+            title: "Get Taiwan Weather Alerts",
+            description:
+                "Get active weather alerts (特報) for a Taiwan county/city, or all counties if omitted",
+            inputSchema: z.object({
+                county: z
+                    .enum(TW_COUNTIES)
+                    .optional()
+                    .describe("Taiwan county/city name; omit for all counties"),
+            }),
+            outputSchema: twAlertsOutputSchema,
+        },
+        async ({ county }) => {
+            const data = await makeCWARequest<CWAAlertsResponse>(
+                "W-C0033-001",
+                county ? { locationName: county } : {},
+            );
+
+            if (!data) {
+                throw new Error("Failed to retrieve Taiwan weather alerts");
+            }
+
+            const alerts: TWAlert[] = data.records.location.flatMap((loc) =>
+                loc.hazardConditions.hazards.map((hazard) => ({
+                    county: loc.locationName,
+                    phenomena: hazard.info?.phenomena ?? hazard.phenomena ?? "Unknown",
+                    significance: hazard.info?.significance ?? hazard.significance ?? "Unknown",
+                    start_time: hazard.validTime?.startTime ?? hazard.startTime ?? "Unknown",
+                    end_time: hazard.validTime?.endTime ?? hazard.endTime ?? "Unknown",
+                })),
+            );
+
+            const suffix = county ? ` for ${county}` : "";
+            const text =
+                alerts.length === 0
+                    ? `No active weather alerts${suffix}`
+                    : `Active weather alerts${suffix}:\n\n${alerts.map(formatTWAlert).join("\n")}`;
+
+            return { content: [{ type: "text", text }], structuredContent: alerts };
         },
     );
 
