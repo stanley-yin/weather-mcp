@@ -1,4 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/server";
+import { McpServer, acceptedContent, inputRequired, inputResponse } from "@modelcontextprotocol/server";
+import type { ServerContext } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
 
@@ -373,11 +374,55 @@ function buildServer(): McpServer {
             inputSchema: z.object({
                 county: z
                     .enum(TW_COUNTIES)
+                    .optional()
                     .describe("Taiwan county/city name, e.g. 臺北市, 高雄市"),
             }),
             outputSchema: twForecastOutputSchema,
         },
-        async ({ county }) => {
+        async ({ county }, ctx: ServerContext) => {
+            if (!county) {
+                const declined = inputResponse(ctx.mcpReq.inputResponses, "county");
+                if (declined.kind === "elicit" && (declined.action === "decline" || declined.action === "cancel")) {
+                    return {
+                        isError: true,
+                        content: [{ type: "text", text: "好的，沒有指定縣市，這次就不查了。" }],
+                    };
+                }
+
+                const answered = acceptedContent<{ county: string }>(
+                    ctx.mcpReq.inputResponses,
+                    "county",
+                );
+                if (answered?.county) {
+                    county = answered.county as (typeof TW_COUNTIES)[number];
+                } else if (server.server.getClientCapabilities()?.elicitation?.form) {
+                    return inputRequired({
+                        inputRequests: {
+                            county: inputRequired.elicit({
+                                message: "請問要查詢哪個縣市的天氣？",
+                                requestedSchema: {
+                                    type: "object",
+                                    properties: {
+                                        county: { type: "string", title: "縣市", enum: [...TW_COUNTIES] },
+                                    },
+                                    required: ["county"],
+                                },
+                            }),
+                        },
+                    });
+                } else {
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: "text",
+                                text: `缺少 county 參數，且目前連線的 client 不支援 elicitation 表單。請直接帶入縣市，例如：${TW_COUNTIES[0]}`,
+                            },
+                        ],
+                    };
+                }
+            }
+
             const data = await makeCWARequest<CWAForecastResponse>("F-C0032-001", {
                 locationName: county,
             });
